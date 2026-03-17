@@ -1,9 +1,14 @@
 /*
- * fb2ssd1306_scale.c – Oversample a larger region (e.g., 255x128) from /dev/fb0
- *                      and scale it down to 128x64 on an SSD1306 OLED.
+ * fb2ssd1306_center.c – Display a 128x64 area centered on the text cursor.
+ * Uses /dev/vcsa0 to read cursor position AND console dimensions.
+ * The cursor is always kept at the center of the OLED; out‑of‑bounds areas become black.
  * 
- * Compile with: gcc -O2 -o fb2ssd1306_scale fb2ssd1306_scale.c
- * Run as root (required for /dev/mem and /dev/i2c access).
+ * DISPLAY LOGIC: Any pixel that is NOT pure black appears white.
+ * 
+ * Compile: gcc -O2 -o fb2ssd1306_center fb2ssd1306_center.c
+ * Run as root: sudo ./fb2ssd1306_center
+ * 
+ * To enable debug output, compile with -DDEBUG
  */
 
 #include <stdio.h>
@@ -20,17 +25,13 @@
 #include <signal.h>
 #include <stdint.h>
 
-#define SSD1306_I2C_ADDR   0x3C        // typical SSD1306 address
+// SSD1306 settings
+#define SSD1306_I2C_ADDR   0x3C
 #define I2C_DEVICE         "/dev/i2c-1"
 #define FB_DEVICE          "/dev/fb0"
-
 #define DISPLAY_WIDTH      128
 #define DISPLAY_HEIGHT     64
 #define DISPLAY_PAGES      (DISPLAY_HEIGHT / 8)
-
-// Oversampling source region dimensions (change these as desired)
-#define SRC_WIDTH          255
-#define SRC_HEIGHT         128
 
 static int fb_fd = -1;
 static int i2c_fd = -1;
@@ -39,18 +40,13 @@ static size_t fb_map_len = 0;
 static volatile int keep_running = 1;
 
 // ----------------------------------------------------------------------
-// I2C helpers (same as before)
+// I2C helpers (unchanged)
 // ----------------------------------------------------------------------
 static int i2c_open(void) {
     int fd = open(I2C_DEVICE, O_RDWR);
-    if (fd < 0) {
-        perror("open i2c");
-        return -1;
-    }
+    if (fd < 0) { perror("open i2c"); return -1; }
     if (ioctl(fd, I2C_SLAVE, SSD1306_I2C_ADDR) < 0) {
-        perror("ioctl i2c slave");
-        close(fd);
-        return -1;
+        perror("ioctl i2c slave"); close(fd); return -1;
     }
     return fd;
 }
@@ -61,10 +57,7 @@ static void i2c_close(int fd) {
 
 static int ssd1306_command(int fd, uint8_t cmd) {
     uint8_t buf[2] = {0x00, cmd};
-    if (write(fd, buf, 2) != 2) {
-        perror("write i2c command");
-        return -1;
-    }
+    if (write(fd, buf, 2) != 2) { perror("write i2c command"); return -1; }
     return 0;
 }
 
@@ -75,16 +68,10 @@ static int ssd1306_data(int fd, uint8_t *data, int len) {
     memcpy(buf + 1, data, len);
     int ret = write(fd, buf, len + 1);
     free(buf);
-    if (ret != len + 1) {
-        perror("write i2c data");
-        return -1;
-    }
+    if (ret != len + 1) { perror("write i2c data"); return -1; }
     return 0;
 }
 
-// ----------------------------------------------------------------------
-// SSD1306 initialisation (unchanged)
-// ----------------------------------------------------------------------
 static int ssd1306_init(int fd) {
     ssd1306_command(fd, 0xAE);
     ssd1306_command(fd, 0xD5); ssd1306_command(fd, 0x80);
@@ -106,10 +93,11 @@ static int ssd1306_init(int fd) {
 }
 
 // ----------------------------------------------------------------------
-// Get luminance (0-255) from a framebuffer pixel
+// Check if a framebuffer pixel is pure black
+// Returns 1 if black, 0 otherwise.
 // ----------------------------------------------------------------------
-static uint8_t pixel_luminance(uint8_t *fb, int x, int y,
-                               struct fb_var_screeninfo *vinfo, int stride) {
+static int pixel_is_black(uint8_t *fb, int x, int y,
+                          struct fb_var_screeninfo *vinfo, int stride) {
     int bpp = vinfo->bits_per_pixel;
     int bytes_per_pixel = bpp / 8;
     uint8_t *p = fb + y * stride + x * bytes_per_pixel;
@@ -120,24 +108,50 @@ static uint8_t pixel_luminance(uint8_t *fb, int x, int y,
         r = (p16 >> vinfo->red.offset)   & ((1 << vinfo->red.length)   - 1);
         g = (p16 >> vinfo->green.offset) & ((1 << vinfo->green.length) - 1);
         b = (p16 >> vinfo->blue.offset)  & ((1 << vinfo->blue.length)  - 1);
-        r = r * 255 / ((1 << vinfo->red.length)   - 1);
-        g = g * 255 / ((1 << vinfo->green.length) - 1);
-        b = b * 255 / ((1 << vinfo->blue.length)  - 1);
+        // For 16-bit, black means all components zero
+        return (r == 0 && g == 0 && b == 0);
     } else if (bpp == 32) {
         uint32_t p32 = *(uint32_t*)p;
         r = (p32 >> vinfo->red.offset)   & 0xFF;
         g = (p32 >> vinfo->green.offset) & 0xFF;
         b = (p32 >> vinfo->blue.offset)  & 0xFF;
+        return (r == 0 && g == 0 && b == 0);
     } else {
-        return 0;
+        // Unsupported depth: treat as black? Safer to return 1 (black) to avoid artifacts.
+        return 1;
     }
-
-    // Luminance: Y = 0.299R + 0.587G + 0.114B
-    return (77 * r + 150 * g + 29 * b) >> 8;
 }
 
 // ----------------------------------------------------------------------
-// Cleanup on exit / signal
+// Get cursor position AND console dimensions using /dev/vcsa0
+// Returns 1 on success, 0 on failure.
+// Coordinates are 1-based (row, col).
+// ----------------------------------------------------------------------
+static int get_console_info(int *cursor_row, int *cursor_col,
+                            int *console_rows, int *console_cols) {
+    int vcsa_fd = open("/dev/vcsa0", O_RDONLY);
+    if (vcsa_fd < 0) {
+        // Fallback to /dev/vcsa (might work if only one console)
+        vcsa_fd = open("/dev/vcsa", O_RDONLY);
+        if (vcsa_fd < 0) return 0;
+    }
+
+    unsigned char header[4];
+    if (read(vcsa_fd, header, 4) != 4) {
+        close(vcsa_fd);
+        return 0;
+    }
+    close(vcsa_fd);
+
+    *console_rows = header[0];
+    *console_cols = header[1];
+    *cursor_col   = header[2];
+    *cursor_row   = header[3];
+    return 1;
+}
+
+// ----------------------------------------------------------------------
+// Cleanup on signal
 // ----------------------------------------------------------------------
 static void cleanup(int sig) {
     (void)sig;
@@ -151,7 +165,13 @@ int main(int argc, char **argv) {
     struct fb_fix_screeninfo finfo;
     struct fb_var_screeninfo vinfo;
     uint8_t display_buffer[DISPLAY_WIDTH * DISPLAY_PAGES];
-    int region_x = 0, region_y;
+    int region_x = 0, region_y = 0;          // top-left of source region (may be negative)
+    int last_cursor_row = -1, last_cursor_col = -1;
+    int frame_count = 0;
+
+    // Font size (pixels per character) – will be set from console info
+    int font_w = 8, font_h = 16; // fallback defaults
+    int console_rows = 0, console_cols = 0;
 
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
@@ -174,22 +194,10 @@ int main(int argc, char **argv) {
 
     printf("Framebuffer: %dx%d, %d bpp, line length %d bytes\n",
            vinfo.xres, vinfo.yres, vinfo.bits_per_pixel, finfo.line_length);
-    printf("Oversampling source region: %dx%d\n", SRC_WIDTH, SRC_HEIGHT);
 
     if (vinfo.bits_per_pixel != 16 && vinfo.bits_per_pixel != 32) {
         fprintf(stderr, "Unsupported bits per pixel: %d\n", vinfo.bits_per_pixel);
         goto out_fb;
-    }
-
-    // Determine source region (bottom-left) – ensure it stays within framebuffer
-    if (vinfo.yres < SRC_HEIGHT) {
-        region_y = 0;
-        fprintf(stderr, "Warning: framebuffer height < %d, using y=0\n", SRC_HEIGHT);
-    } else {
-        region_y = vinfo.yres - SRC_HEIGHT;
-    }
-    if (vinfo.xres < SRC_WIDTH) {
-        fprintf(stderr, "Warning: framebuffer width < %d, will clamp\n", SRC_WIDTH);
     }
 
     // Map framebuffer
@@ -214,45 +222,68 @@ int main(int argc, char **argv) {
 
     // ---------- Main loop ----------
     while (keep_running) {
-        // Clear display buffer
-        memset(display_buffer, 0, sizeof(display_buffer));
-
-        // For each output pixel (x_out, y_out) determine the corresponding
-        // source rectangle and compute average luminance.
-        for (int y_out = 0; y_out < DISPLAY_HEIGHT; y_out++) {
-            // Source y range for this output row
-            int src_y_start = region_y + (y_out * SRC_HEIGHT) / DISPLAY_HEIGHT;
-            int src_y_end   = region_y + ((y_out + 1) * SRC_HEIGHT + DISPLAY_HEIGHT - 1) / DISPLAY_HEIGHT;
-            if (src_y_end > region_y + SRC_HEIGHT) src_y_end = region_y + SRC_HEIGHT;
-            if (src_y_start >= vinfo.yres) continue; // out of bounds
-
-            for (int x_out = 0; x_out < DISPLAY_WIDTH; x_out++) {
-                // Source x range for this output column
-                int src_x_start = region_x + (x_out * SRC_WIDTH) / DISPLAY_WIDTH;
-                int src_x_end   = region_x + ((x_out + 1) * SRC_WIDTH + DISPLAY_WIDTH - 1) / DISPLAY_WIDTH;
-                if (src_x_end > region_x + SRC_WIDTH) src_x_end = region_x + SRC_WIDTH;
-                if (src_x_start >= vinfo.xres) continue; // out of bounds
-
-                // Compute average luminance over the source rectangle
-                uint32_t sum = 0;
-                int count = 0;
-                for (int sy = src_y_start; sy < src_y_end; sy++) {
-                    if (sy >= vinfo.yres) break;
-                    for (int sx = src_x_start; sx < src_x_end; sx++) {
-                        if (sx >= vinfo.xres) break;
-                        sum += pixel_luminance(fb_map, sx, sy, &vinfo, finfo.line_length);
-                        count++;
+        // Update cursor position every 5 frames (~0.5 seconds at 10 fps)
+        if (frame_count % 5 == 0) {
+            int cursor_row, cursor_col;
+            int new_console_rows, new_console_cols;
+            if (get_console_info(&cursor_row, &cursor_col,
+                                 &new_console_rows, &new_console_cols)) {
+                // If console dimensions changed, update font size
+                if (new_console_rows != console_rows || new_console_cols != console_cols) {
+                    console_rows = new_console_rows;
+                    console_cols = new_console_cols;
+                    if (console_rows > 0 && console_cols > 0) {
+                        font_w = vinfo.xres / console_cols;
+                        font_h = vinfo.yres / console_rows;
+                        printf("Console size: %dx%d chars, font size: %dx%d pixels\n",
+                               console_cols, console_rows, font_w, font_h);
                     }
                 }
 
-                uint8_t pixel_value = 0;
-                if (count > 0) {
-                    uint8_t avg = sum / count;
-                    // Threshold at 128 (adjust if needed)
-                    pixel_value = (avg > 128) ? 1 : 0;
+                // Sanity check: row and col should be within console bounds
+                if (cursor_row >= 1 && cursor_row <= console_rows &&
+                    cursor_col >= 1 && cursor_col <= console_cols) {
+                    if (cursor_row != last_cursor_row || cursor_col != last_cursor_col) {
+                        last_cursor_row = cursor_row;
+                        last_cursor_col = cursor_col;
+
+                        // Convert cursor to pixel coordinates (center of character cell)
+                        int cursor_pixel_x = (cursor_col - 1) * font_w + font_w / 2;
+                        int cursor_pixel_y = (cursor_row - 1) * font_h + font_h / 2;
+
+                        // Center the 128x64 source region on the cursor (NO CLAMPING)
+                        region_x = cursor_pixel_x - DISPLAY_WIDTH / 2;
+                        region_y = cursor_pixel_y - DISPLAY_HEIGHT / 2-16;
+
+#ifdef DEBUG
+                        fprintf(stderr, "Cursor: (%d,%d) -> pixel (%d,%d) -> region (%d,%d)\n",
+                                cursor_row, cursor_col, cursor_pixel_x, cursor_pixel_y,
+                                region_x, region_y);
+#endif
+                    }
+                } else {
+                    fprintf(stderr, "Cursor position out of console bounds: (%d,%d) vs (%d,%d)\n",
+                            cursor_row, cursor_col, console_rows, console_cols);
+                }
+            }
+        }
+
+        // Build display buffer: directly map each output pixel to one source pixel
+        // Pixels outside the framebuffer become black (0)
+        // Any pixel that is not pure black becomes white (1)
+        memset(display_buffer, 0, sizeof(display_buffer));
+        for (int y_out = 0; y_out < DISPLAY_HEIGHT; y_out++) {
+            int src_y = region_y + y_out;
+            for (int x_out = 0; x_out < DISPLAY_WIDTH; x_out++) {
+                int src_x = region_x + x_out;
+                uint8_t pixel_value = 0; // default black
+
+                // Only read if within framebuffer bounds
+                if (src_x >= 0 && src_x < vinfo.xres && src_y >= 0 && src_y < vinfo.yres) {
+                    int is_black = pixel_is_black(fb_map, src_x, src_y, &vinfo, finfo.line_length);
+                    pixel_value = is_black ? 0 : 1; // non-black => white
                 }
 
-                // Place pixel in the display buffer (page-oriented)
                 int page = y_out / 8;
                 int bit  = y_out % 8;
                 if (pixel_value) {
@@ -271,6 +302,7 @@ int main(int argc, char **argv) {
             ssd1306_data(i2c_fd, &display_buffer[page * DISPLAY_WIDTH], DISPLAY_WIDTH);
         }
 
+        frame_count++;
         usleep(100000);   // ~10 fps
     }
 
