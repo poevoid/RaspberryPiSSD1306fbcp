@@ -1,0 +1,21 @@
+[Unit]
+Description=Display framebuffer on SSD1306 OLED
+# Start after the system has reached the multi-user target (basic system is up)
+After=multi-user.target
+
+[Service]
+# The program runs continuously
+Type=simple
+# Full path to your compiled program. CHANGE THIS IF NEEDED.
+ExecStart=/etc/opt/oled-fbcp
+# Automatically restart the program if it crashes or stops
+Restart=always
+# The program needs root access for /dev/mem and /dev/i2c
+User=root
+Group=root
+# Set the working directory to the program's location (optional but good practice)
+WorkingDirectory=/etc/opt
+
+[Install]
+# Make this service start when the system reaches the multi-user target (normal boot)
+WantedBy=multi-user.target
